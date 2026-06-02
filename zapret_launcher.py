@@ -161,7 +161,7 @@ def ensure_installed(status, progress) -> tuple[str, str]:
     # Качаем заново
     status(f"Скачиваю версию {tag}…")
     if os.path.isdir(FILES_DIR):
-        _rmtree_quiet(FILES_DIR)
+        remove_dir_robust(FILES_DIR)
     os.makedirs(FILES_DIR, exist_ok=True)
 
     zip_path = os.path.join(INSTALL_DIR, "release.zip")
@@ -184,12 +184,17 @@ def ensure_installed(status, progress) -> tuple[str, str]:
     return root, tag
 
 
-def _rmtree_quiet(path: str) -> None:
+def remove_dir_robust(path: str, attempts: int = 12) -> bool:
+    """Удаляет папку с повторами — на случай, если файлы ещё заняты (winws/WinDivert)."""
     import shutil
-    try:
-        shutil.rmtree(path)
-    except OSError:
-        pass
+    for _ in range(attempts):
+        if not os.path.exists(path):
+            return True
+        try:
+            shutil.rmtree(path)
+        except OSError:
+            time.sleep(0.5)
+    return not os.path.exists(path)
 
 
 # ----------------------------------------------------------------------------- #
@@ -242,7 +247,7 @@ class App(tk.Tk):
         self.resizable(False, False)
         self._busy = False
         self._build_ui()
-        self._center(420, 360)
+        self._center(420, 420)
 
         # Периодически сверяем реальное состояние winws.exe с кнопкой
         self.after(500, self._sync_state)
@@ -261,7 +266,15 @@ class App(tk.Tk):
                              activeforeground="white", relief="flat", bd=0,
                              width=16, height=2, cursor="hand2",
                              command=self.on_toggle)
-        self.btn.pack(pady=26)
+        self.btn.pack(pady=(26, 8))
+
+        # Вторичная кнопка — проверка обновлений
+        self.upd_btn = tk.Button(self, text="Проверить обновление",
+                                 font=("Segoe UI", 10), bg=CARD, fg=TEXT,
+                                 activebackground=GREY, activeforeground=TEXT,
+                                 relief="flat", bd=0, cursor="hand2",
+                                 padx=12, pady=6, command=self.on_check_update)
+        self.upd_btn.pack(pady=(0, 12))
 
         # Прогресс
         style = ttk.Style(self)
@@ -357,10 +370,100 @@ class App(tk.Tk):
 
         threading.Thread(target=work, daemon=True).start()
 
+    # --- проверка обновления ----------------------------------------------- #
+    def on_check_update(self):
+        if self._busy:
+            return
+        self._set_busy(True, "Проверяю обновления…")
+        self.ui(self._show_progress, True)
+
+        def progress(frac):
+            self.ui(self.pbar.config, {"value": int(frac * 100)})
+            self.ui(self.status.config, {"text": f"Скачиваю… {int(frac*100)}%"})
+
+        def status(text):
+            self.ui(self.status.config, {"text": text})
+
+        def work():
+            try:
+                status("Проверяю обновления…")
+                local = read_local_version()
+                latest, _url = fetch_latest_release()
+                has_files = find_bat_root(FILES_DIR) is not None
+
+                # Уже последняя версия — ничего не трогаем
+                if has_files and local == latest:
+                    self.ui(self._update_uptodate, latest)
+                    return
+
+                # Есть обновление: выключить → удалить → скачать → включить
+                status(f"Найдена версия {latest}. Обновляю…")
+                if is_running():
+                    status("Выключаю обход…")
+                    stop_strategy()
+                    for _ in range(20):           # ждём, пока winws закроется
+                        if not is_running():
+                            break
+                        time.sleep(0.3)
+
+                status("Удаляю старую версию…")
+                if not remove_dir_robust(FILES_DIR):
+                    raise RuntimeError(
+                        "Не удалось удалить старую версию — файлы заняты.\n"
+                        "Закройте обход и попробуйте снова.")
+
+                root, version = ensure_installed(status, progress)
+                self.ui(self.version_lbl.config, {"text": f"Версия {version}"})
+
+                alt = latest_alt_bat(root)
+                if not alt:
+                    raise RuntimeError("Не найдена ни одна ALT-стратегия.")
+                bat_path, bat_name = alt
+                status(f"Запускаю {bat_name}…")
+                start_strategy(bat_path)
+
+                ok = False
+                for _ in range(24):
+                    if is_running():
+                        ok = True
+                        break
+                    time.sleep(0.5)
+
+                if ok:
+                    self.ui(self._finish_update_on, version, bat_name)
+                else:
+                    self.ui(self._fail,
+                            "Обновление скачано, но обход не запустился.\n"
+                            "Проверьте антивирус (WinDivert) и попробуйте ещё раз.")
+            except Exception as e:  # noqa: BLE001
+                self.ui(self._fail, str(e))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _update_uptodate(self, version):
+        self._set_busy(False)
+        self._show_progress(False)
+        self.version_lbl.config(text=f"Версия {version}")
+        self._sync_state()
+        self.status.config(text=f"✓ Установлена последняя версия ({version})",
+                           fg=GREEN)
+        messagebox.showinfo(APP_TITLE,
+                            f"У вас уже последняя версия: {version}")
+
+    def _finish_update_on(self, version, bat_name):
+        self._set_busy(False)
+        self._show_progress(False)
+        self.btn.config(text="Выключить", bg=RED, activebackground=RED_HV)
+        self.status.config(text=f"✓ Обновлено до {version}  ({bat_name})", fg=GREEN)
+        messagebox.showinfo(APP_TITLE,
+                            f"Обновлено до версии {version}. Обход включён.")
+
     # --- состояния ---------------------------------------------------------- #
     def _set_busy(self, busy, text=None):
         self._busy = busy
-        self.btn.config(state="disabled" if busy else "normal")
+        state = "disabled" if busy else "normal"
+        self.btn.config(state=state)
+        self.upd_btn.config(state=state)
         if busy:
             self.btn.config(bg=GREY, activebackground=GREY)
         if text:
@@ -369,7 +472,7 @@ class App(tk.Tk):
     def _show_progress(self, show):
         if show:
             self.pbar.config(value=0)
-            self.pbar.pack(pady=(0, 6))
+            self.pbar.pack(before=self.status, pady=(0, 6))
         else:
             self.pbar.pack_forget()
 
